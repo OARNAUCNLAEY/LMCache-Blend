@@ -6,7 +6,7 @@ import abc
 # Third Party
 from transformers import AutoTokenizer
 import torch
-
+import os
 # First Party
 from lmcache.config import LMCacheEngineMetadata
 from lmcache.logging import init_logger
@@ -280,7 +280,8 @@ class SegmentTokenDatabase(TokenDatabase):
         # TODO (Jiayi): figure out how to decide when
         # to use `1:` (whether there's a special starting token
         # in the beginning)
-        self.sep_tokens = self.tokenizer.encode(config.blend_special_str)[1:]
+        self.sep_tokens = [os.environ['LMCACHE_SEP_TOKEN_ID']]
+        print("Seperator Token id ", self.sep_tokens)
         self.sep_tokens = torch.tensor(self.sep_tokens, device="cpu")
         self.sep_len = len(self.sep_tokens)
 
