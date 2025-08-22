@@ -160,7 +160,7 @@ class RequestTracker:
 
         self.token_ids.extend(new_token_ids)
 
-        if len(new_block_ids) == 0:
+        if new_block_ids == None or len(new_block_ids) == 0:
             new_block_ids = []
         elif isinstance(new_block_ids, tuple):
             new_block_ids = new_block_ids[0]
@@ -973,7 +973,7 @@ class LMCacheConnectorV1Impl:
                     f"but it is scheduled to be cached"
                 )
             new_block_ids = cached_reqs.new_block_ids[i]
-
+            print(cached_reqs.new_block_ids)
             request_tracker.update(new_token_ids, new_block_ids)
 
             req_meta = ReqMeta.from_request_tracker(
