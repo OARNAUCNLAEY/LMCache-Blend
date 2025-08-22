@@ -280,7 +280,11 @@ class SegmentTokenDatabase(TokenDatabase):
         # TODO (Jiayi): figure out how to decide when
         # to use `1:` (whether there's a special starting token
         # in the beginning)
-        self.sep_tokens = [os.environ['LMCACHE_SEP_TOKEN_ID']]
+        if 'LMCACHE_SEP_TOKEN_ID' in os.environ:
+            self.sep_tokens = [int(os.environ['LMCACHE_SEP_TOKEN_ID'])]
+        else:
+            self.sep_tokens = self.tokenizer.encode(config.blend_special_str)[1:]
+
         print("Seperator Token id ", self.sep_tokens)
         self.sep_tokens = torch.tensor(self.sep_tokens, device="cpu")
         self.sep_len = len(self.sep_tokens)
