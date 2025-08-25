@@ -10,7 +10,7 @@ import torch
 
 # First Party
 from lmcache.logging import init_logger
-from lmcache.observability import LMCStatsMonitor
+from lmcache.observability import LMCStatsMonitor, CacheEvent
 from lmcache.utils import CacheEngineKey, _lmcache_nvtx_annotate
 from lmcache.v1.cache_controller.message import KVAdmitMsg, KVEvictMsg
 from lmcache.v1.config import LMCacheEngineConfig
@@ -76,6 +76,7 @@ class LocalCPUBackend(StorageBackendInterface):
         with self.cpu_lock:
             if key not in self.hot_cache:
                 return False
+            self.stats_monitor.add_cache_event(CacheEvent.HIT, key)
             if pin:
                 self.hot_cache[key].pin()
                 # vllm lookup sets pin to True
@@ -109,6 +110,7 @@ class LocalCPUBackend(StorageBackendInterface):
             memory_obj.ref_count_up()
 
             self.usage += memory_obj.get_size()
+            self.stats_monitor.add_cache_event(CacheEvent.STORE, key)
             self.stats_monitor.update_local_cache_usage(self.usage)
 
             # TODO(Jiayi): optimize this with batching?
@@ -154,6 +156,7 @@ class LocalCPUBackend(StorageBackendInterface):
         with self.cpu_lock:
             if key not in self.hot_cache:
                 return None
+            self.stats_monitor.add_cache_event(CacheEvent.BLOCKING_HIT, key)
             memory_obj = self.hot_cache[key]
             # ref count up for caller to avoid situation where the memory_obj
             # is evicted from the local cpu backend before the caller calls
@@ -171,6 +174,7 @@ class LocalCPUBackend(StorageBackendInterface):
         with self.cpu_lock:
             if key not in self.hot_cache:
                 return None
+            self.stats_monitor.add_cache_event(CacheEvent.NON_BLOCKING_HIT, key)
             memory_obj = self.hot_cache[key]
             memory_obj.ref_count_up()
             f: Future = Future()
@@ -202,6 +206,7 @@ class LocalCPUBackend(StorageBackendInterface):
                 memory_obj.ref_count_down()
 
             self.usage -= memory_obj.get_size()
+            self.stats_monitor.add_cache_event(CacheEvent.EVICT, key)
             self.stats_monitor.update_local_cache_usage(self.usage)
 
             if self.lmcache_worker is not None:

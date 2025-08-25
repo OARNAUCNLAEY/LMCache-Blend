@@ -12,10 +12,17 @@ import prometheus_client
 # First Party
 from lmcache.config import LMCacheEngineMetadata
 from lmcache.logging import init_logger
-from lmcache.utils import thread_safe
-
+from lmcache.utils import thread_safe, CacheEngineKey
+from enum import Enum
+from datetime import datetime
+from transformers import AutoTokenizer, PreTrainedTokenizer, PreTrainedTokenizerFast
 logger = init_logger(__name__)
-
+class CacheEvent(Enum):
+    STORE = 1
+    EVICT = 2
+    HIT = 3
+    BLOCKING_HIT = 4
+    NON_BLOCKING_HIT = 5
 
 @dataclass
 class LMCacheStats:
@@ -52,6 +59,9 @@ class LMCacheStats:
     time_to_store: List[float]
     retrieve_speed: List[float]  # Tokens per second
     store_speed: List[float]  # Tokens per second
+
+    cache_events: List
+    hash_chunk_mapping: Dict
 
 
 @dataclass
@@ -129,6 +139,16 @@ class LMCStatsMonitor:
         self.retrieve_request_id = 0
         self.store_request_id = 0
 
+        self.hash_chunk_mapping = {-1 : "Hash Not Found"}
+        self.cache_events = []
+        self.enable_logging = 0
+        if "LMCACHE_ENABLE_CACHE_LOGGING" in os.environ and int(os.environ["LMCACHE_ENABLE_CACHE_LOGGING"]) == 1:
+            self.enable_logging = 1
+        self.model_name = os.environ["MODEL"]
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.model_name,
+        )
+
     @thread_safe
     def on_retrieve_request(self, num_tokens: int) -> int:
         """
@@ -180,6 +200,21 @@ class LMCStatsMonitor:
         store_stats.end_time = curr_time
         if num_tokens >= 0:
             store_stats.num_tokens = num_tokens
+
+    @thread_safe
+    def add_to_hash_mapping(self, key : CacheEngineKey, token_id: List[int]):
+        if self.enable_logging == 1:
+            self.hash_chunk_mapping[key.chunk_hash] = self.tokenizer.decode(token_id)
+        return
+    
+    @thread_safe
+    def add_cache_event(self, event: CacheEvent, key : CacheEngineKey):
+        if self.enable_logging == 1:
+            if key.chunk_hash in self.hash_chunk_mapping:
+                self.cache_events.append((event.name, key.chunk_hash, str(key)))
+            else:
+                self.cache_events.append((event.name, -1 , str(key)))
+        return
 
     @thread_safe
     def update_local_cache_usage(self, usage: int):
@@ -263,6 +298,10 @@ class LMCStatsMonitor:
             if store_stats.end_time == 0:
                 new_store_requests[request_id] = store_stats
         self.store_requests = new_store_requests
+    
+        self.cache_events = []
+        self.hash_chunk_mapping = {-1 : "Hash Not Found"}
+        
 
     @thread_safe
     def get_stats_and_clear(self) -> LMCacheStats:
@@ -321,6 +360,8 @@ class LMCStatsMonitor:
             time_to_store=time_to_store,
             retrieve_speed=retrieve_speed,
             store_speed=store_speed,
+            cache_events = self.cache_events,
+            hash_chunk_mapping = self.hash_chunk_mapping,
         )
         self._clear()
         return ret
@@ -778,7 +819,6 @@ class GaugeJson:
         for label in labelnames:
             self.gauge[label] = []
     def set(self, data):
-        from datetime import datetime
         current_utc_time = str(datetime.now())
         for label in self.labelnames:
             if isinstance(data, (float, int)):
@@ -824,6 +864,9 @@ class JsonLogger:
     _gauge_cls = GaugeJson
     _counter_cls = CounterJson
     _histogram_cls = HistogramJson
+    _hash_token_mapping = {}
+    _cache_events = []
+
     def _commit_json(self):
         final_dict = {
             "labels": self.labels,
@@ -850,6 +893,9 @@ class JsonLogger:
             self.counter_remote_ping_errors.name : self.counter_remote_ping_errors.get_dict(),
             self.counter_remote_ping_successes.name : self.counter_remote_ping_successes.get_dict(),
             self.gauge_remote_ping_error_code.name : self.gauge_remote_ping_error_code.get_dict(),
+            "Hash <-> token" : self._hash_token_mapping,
+            "Cache Events" : [(event, self._hash_token_mapping[hash_chunk], key) for (event, hash_chunk, key) in self._cache_events],
+
         }
         import json
         with open(self.path, 'w') as json_file:
@@ -857,7 +903,7 @@ class JsonLogger:
     
     def __init__(self, metadata: LMCacheEngineMetadata):
 
-        self.path = "/storage/containers/logs/lmcache/metrics.json"
+        self.path = "/storage/containers/logs/lmcache/metrics_" + str(datetime.now()) + ".json"
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         self.metadata = metadata
 
@@ -1149,7 +1195,20 @@ class JsonLogger:
         for value in data:
             histogram.observe(value)
 
+    def convert_to_string(self, token_ids):
+        return token_ids ## TODO
+    
+    def _log_hash_mapping(self, hash_token_mapping_batch):
+        for key in hash_token_mapping_batch:
+            self._hash_token_mapping[key] = self.convert_to_string(hash_token_mapping_batch[key])
+    
+    def _log_cache_events(self, cache_events):
+        for (event, chunk_hash, key) in cache_events:
+            self._cache_events.append((event, chunk_hash, key))
+
     def log_json(self, stats: LMCacheStats):
+        self._log_hash_mapping(stats.hash_chunk_mapping)
+        self._log_cache_events(stats.cache_events)
         self._log_counter(
             self.counter_num_retrieve_requests, stats.interval_retrieve_requests
         )
@@ -1254,7 +1313,7 @@ class LMCacheStatsLogger:
         self.metadata = metadata
         self.log_interval = log_interval
         self.monitor = LMCStatsMonitor.GetOrCreate()
-        self.logger = JsonLogger.GetOrCreate(metadata)
+        self.prometheus_logger = JsonLogger.GetOrCreate(metadata)
         self.is_running = True
 
         self.thread = threading.Thread(target=self.log_worker, daemon=True)
@@ -1263,7 +1322,8 @@ class LMCacheStatsLogger:
     def log_worker(self):
         while self.is_running:
             stats = self.monitor.get_stats_and_clear()
-            self.logger.log_json(stats)
+            if "LMCACHE_ENABLE_CACHE_LOGGING" in os.environ and int(os.environ["LMCACHE_ENABLE_CACHE_LOGGING"]) == 1:
+                self.prometheus_logger.log_json(stats)
             time.sleep(self.log_interval)
 
     def shutdown(self):

@@ -12,6 +12,7 @@ from lmcache.config import LMCacheEngineMetadata
 from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey, _lmcache_nvtx_annotate
 from lmcache.v1.config import LMCacheEngineConfig
+from lmcache.observability import LMCStatsMonitor
 
 logger = init_logger(__name__)
 
@@ -43,6 +44,7 @@ class TokenDatabase(metaclass=abc.ABCMeta):
         metadata: Optional[LMCacheEngineMetadata] = None,
     ):
         vllm_is_available = True
+        self.stats_monitor = LMCStatsMonitor.GetOrCreate()
         try:
             # Third Party
             from vllm.utils import sha256, sha256_cbor_64bit
@@ -246,6 +248,7 @@ class ChunkedTokenDatabase(TokenDatabase):
                 if start_idx < num_falses:
                     continue
                 else:
+                    self.stats_monitor.add_to_hash_mapping(self._make_key_by_hash(hash_val), token_chunks[chunk_id].tolist())
                     if make_key:
                         yield start_idx, end_idx, self._make_key_by_hash(hash_val)
                     else:
@@ -358,6 +361,7 @@ class SegmentTokenDatabase(TokenDatabase):
                 end_idx += self.sep_len
                 # end_idx = min(end_idx, len(tokens))
             if start_idx >= num_falses:
+                self.stats_monitor.add_to_hash_mapping(self._make_key_by_hash(self._hash_tokens(token_chunk)), token_chunk.tolist())
                 if make_key:
                     yield (
                         start_idx,
