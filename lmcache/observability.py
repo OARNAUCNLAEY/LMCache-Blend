@@ -866,8 +866,18 @@ class JsonLogger:
     _histogram_cls = HistogramJson
     _hash_token_mapping = {}
     _cache_events = []
+    _cache_event_counter_by_hash = {}
 
     def _commit_json(self):
+        sorted_events = {}
+        for event in CacheEvent._member_names_:
+            sorted_events[event] = []
+            for hash_key in self._cache_event_counter_by_hash:
+                if event not in self._cache_event_counter_by_hash[hash_key]:
+                    break
+                sorted_events[event].append((hash_key, self._cache_event_counter_by_hash[hash_key][event]))
+            sorted_events[event] = sorted(sorted_events[event], key=lambda x: -1*x[1])
+        
         final_dict = {
             "labels": self.labels,
             self.counter_num_retrieve_requests.name : self.counter_num_retrieve_requests.get_dict(),
@@ -893,9 +903,10 @@ class JsonLogger:
             self.counter_remote_ping_errors.name : self.counter_remote_ping_errors.get_dict(),
             self.counter_remote_ping_successes.name : self.counter_remote_ping_successes.get_dict(),
             self.gauge_remote_ping_error_code.name : self.gauge_remote_ping_error_code.get_dict(),
+            "Top chunks by event": sorted_events,
+            "Cache Events by hash": self._cache_event_counter_by_hash,
             "Hash <-> token" : self._hash_token_mapping,
-            "Cache Events" : [(event, self._hash_token_mapping[hash_chunk], key) for (event, hash_chunk, key) in self._cache_events],
-
+            "Cache Events" : [(event, hash_chunk, key) for (event, hash_chunk, key) in self._cache_events],
         }
         import json
         with open(self.path, 'w') as json_file:
@@ -1205,6 +1216,16 @@ class JsonLogger:
     def _log_cache_events(self, cache_events):
         for (event, chunk_hash, key) in cache_events:
             self._cache_events.append((event, chunk_hash, key))
+            if chunk_hash in self._cache_event_counter_by_hash:
+                self._cache_event_counter_by_hash[chunk_hash][event] += 1
+            else:
+                self._cache_event_counter_by_hash[chunk_hash] = {
+                    CacheEvent.STORE.name : 0,
+                    CacheEvent.BLOCKING_HIT.name : 0,
+                    CacheEvent.EVICT.name : 0,
+                    CacheEvent.HIT.name : 0,
+                    CacheEvent.NON_BLOCKING_HIT.name : 0,
+                }
 
     def log_json(self, stats: LMCacheStats):
         self._log_hash_mapping(stats.hash_chunk_mapping)
@@ -1322,7 +1343,9 @@ class LMCacheStatsLogger:
     def log_worker(self):
         while self.is_running:
             stats = self.monitor.get_stats_and_clear()
-            if "LMCACHE_ENABLE_CACHE_LOGGING" in os.environ and int(os.environ["LMCACHE_ENABLE_CACHE_LOGGING"]) == 1:
+            if "LMCACHE_ENABLE_CACHE_LOGGING" in os.environ and (
+                int(os.environ["LMCACHE_ENABLE_CACHE_LOGGING"]) == 1
+                 or int(os.environ["LMCACHE_ENABLE_CACHE_LOGGING"]) == 2):
                 self.prometheus_logger.log_json(stats)
             time.sleep(self.log_interval)
 

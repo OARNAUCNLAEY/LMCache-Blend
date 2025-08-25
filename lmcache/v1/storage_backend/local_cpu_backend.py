@@ -157,6 +157,7 @@ class LocalCPUBackend(StorageBackendInterface):
             if key not in self.hot_cache:
                 return None
             self.stats_monitor.add_cache_event(CacheEvent.BLOCKING_HIT, key)
+            self.stats_monitor.add_cache_event(CacheEvent.HIT, key)
             memory_obj = self.hot_cache[key]
             # ref count up for caller to avoid situation where the memory_obj
             # is evicted from the local cpu backend before the caller calls
@@ -175,6 +176,7 @@ class LocalCPUBackend(StorageBackendInterface):
             if key not in self.hot_cache:
                 return None
             self.stats_monitor.add_cache_event(CacheEvent.NON_BLOCKING_HIT, key)
+            self.stats_monitor.add_cache_event(CacheEvent.HIT, key)
             memory_obj = self.hot_cache[key]
             memory_obj.ref_count_up()
             f: Future = Future()
