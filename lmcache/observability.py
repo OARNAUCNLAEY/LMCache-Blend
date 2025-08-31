@@ -210,10 +210,7 @@ class LMCStatsMonitor:
     @thread_safe
     def add_cache_event(self, event: CacheEvent, key : CacheEngineKey):
         if self.enable_logging == 1:
-            if key.chunk_hash in self.hash_chunk_mapping:
-                self.cache_events.append((event.name, key.chunk_hash, str(key)))
-            else:
-                self.cache_events.append((event.name, -1 , str(key)))
+            self.cache_events.append((event.name, key.chunk_hash, str(key)))
         return
 
     @thread_safe
@@ -875,9 +872,11 @@ class JsonLogger:
             for hash_key in self._cache_event_counter_by_hash:
                 if event not in self._cache_event_counter_by_hash[hash_key]:
                     break
-                sorted_events[event].append((hash_key, self._cache_event_counter_by_hash[hash_key][event]))
+                sorted_events[event].append((self._hash_token_mapping[hash_key], self._cache_event_counter_by_hash[hash_key][event]))
             sorted_events[event] = sorted(sorted_events[event], key=lambda x: -1*x[1])
-        
+        custom_cache_event_counter = {}
+        for key in self._cache_event_counter_by_hash:
+            custom_cache_event_counter[self._hash_token_mapping[key]] = self._cache_event_counter_by_hash[key]
         final_dict = {
             "labels": self.labels,
             self.counter_num_retrieve_requests.name : self.counter_num_retrieve_requests.get_dict(),
@@ -904,7 +903,7 @@ class JsonLogger:
             self.counter_remote_ping_successes.name : self.counter_remote_ping_successes.get_dict(),
             self.gauge_remote_ping_error_code.name : self.gauge_remote_ping_error_code.get_dict(),
             "Top chunks by event": sorted_events,
-            "Cache Events by hash": self._cache_event_counter_by_hash,
+            "Cache Events by strings": custom_cache_event_counter,
             "Hash <-> token" : self._hash_token_mapping,
             "Cache Events" : [(event, hash_chunk, key) for (event, hash_chunk, key) in self._cache_events],
         }
@@ -1216,9 +1215,7 @@ class JsonLogger:
     def _log_cache_events(self, cache_events):
         for (event, chunk_hash, key) in cache_events:
             self._cache_events.append((event, chunk_hash, key))
-            if chunk_hash in self._cache_event_counter_by_hash:
-                self._cache_event_counter_by_hash[chunk_hash][event] += 1
-            else:
+            if chunk_hash not in self._cache_event_counter_by_hash:
                 self._cache_event_counter_by_hash[chunk_hash] = {
                     CacheEvent.STORE.name : 0,
                     CacheEvent.BLOCKING_HIT.name : 0,
@@ -1226,6 +1223,7 @@ class JsonLogger:
                     CacheEvent.HIT.name : 0,
                     CacheEvent.NON_BLOCKING_HIT.name : 0,
                 }
+            self._cache_event_counter_by_hash[chunk_hash][event] += 1
 
     def log_json(self, stats: LMCacheStats):
         self._log_hash_mapping(stats.hash_chunk_mapping)
