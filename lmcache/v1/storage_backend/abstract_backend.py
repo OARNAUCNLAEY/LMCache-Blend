@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from concurrent.futures import Future
-from typing import List, Optional
+from typing import List, Optional, Sequence
 import abc
 
 # Third Party
@@ -9,7 +9,7 @@ import torch
 
 # First Party
 from lmcache.utils import CacheEngineKey
-from lmcache.v1.memory_management import MemoryObj
+from lmcache.v1.memory_management import MemoryFormat, MemoryObj
 
 
 class StorageBackendInterface(metaclass=abc.ABCMeta):
@@ -59,17 +59,21 @@ class StorageBackendInterface(metaclass=abc.ABCMeta):
     @abc.abstractmethod
     def batched_submit_put_task(
         self,
-        keys: List[CacheEngineKey],
+        keys: Sequence[CacheEngineKey],
         objs: List[MemoryObj],
         transfer_spec=None,
-    ) -> Optional[List[Future]]:
+    ) -> None:
         """
         An async function to put the MemoryObj into the storage backend.
 
         :param List[CacheEngineKey] keys: The keys of the MemoryObjs.
         :param List[MemoryObj] objs: The MemoryObjs to be stored.
 
-        :return: a list of future objects
+        :return: Nothing
+
+        :note: This function will have the side effect that modifies the
+            underlying key-value mappings in the storage backend. The side
+            effect may change the result of lookup and get.
         """
         raise NotImplementedError
 
@@ -120,9 +124,9 @@ class StorageBackendInterface(metaclass=abc.ABCMeta):
     def batched_get_blocking(
         self,
         keys: List[CacheEngineKey],
-    ) -> List[MemoryObj]:
+    ) -> List[Optional[MemoryObj]]:
         """
-        A blcocking function to get the kv cache from the storage backend.
+        A blocking function to get the kv cache from the storage backend.
 
         :param List[CacheEngineKey] keys: The keys of the MemoryObjs.
 
@@ -162,12 +166,12 @@ class StorageBackendInterface(metaclass=abc.ABCMeta):
         raise NotImplementedError
 
     @abc.abstractmethod
-    def remove(self, key: CacheEngineKey, free_obj: bool = True) -> bool:
+    def remove(self, key: CacheEngineKey, force: bool = True) -> bool:
         """
         remove a memory object.
 
         :param CacheEngineKey key: The key of the MemoryObj.
-        :param bool free_obj: Whether to free the MemoryObj after removing it.
+        :param bool force: Whether to it is a forced remove from the external.
 
         :return: a bool indicates whether remove is successful.
         """
@@ -177,19 +181,19 @@ class StorageBackendInterface(metaclass=abc.ABCMeta):
     def batched_remove(
         self,
         keys: list[CacheEngineKey],
-        free_obj: bool = True,
+        force: bool = True,
     ) -> int:
         """
         Remove a list of memory objects.
 
         :param list[CacheEngineKey] keys: The keys of the MemoryObjs.
-        :param bool free_obj: Whether to free the MemoryObjs after removing them.
+        :param bool force: Whether to force remove the memory objects.
 
         :return: a int indicates the number of removed memory objects.
         """
         num_removed = 0
         for key in keys:
-            num_removed += self.remove(key, free_obj=free_obj)
+            num_removed += self.remove(key, force=force)
         return num_removed
 
     @abc.abstractmethod
@@ -198,5 +202,71 @@ class StorageBackendInterface(metaclass=abc.ABCMeta):
     ) -> None:
         """
         Close the storage backend.
+        """
+        raise NotImplementedError
+
+
+class AllocatorBackendInterface(StorageBackendInterface):
+    """
+    return self.allocator_backend.allocate(
+        shape, dtype, fmt, eviction=eviction, busy_loop=busy_loop
+    )
+    """
+
+    @abc.abstractmethod
+    def allocate(
+        self,
+        shape: torch.Size,
+        dtype: torch.dtype,
+        fmt: MemoryFormat = MemoryFormat.KV_2LTD,
+        eviction: bool = True,
+        busy_loop: bool = True,
+    ) -> Optional[MemoryObj]:
+        """
+        Allocates memory in the backend to hold a tensor of the given shape.
+
+        :param torch.Size shape: The shape of the tensor to allocate.
+        :param torch.dtype dtype: The dtype of the tensor to allocate.
+        :param MemoryFormat fmt: The format of the memory to allocate.
+        :param bool eviction: whether to enable eviction when allocating.
+        :param bool busy_loop: whether to enable a busy loop to wait
+            for in-progress store operations to finish and release the
+            memory space for retrieve.
+
+        :return: A MemoryObj wrapping the allocated memory. Returns
+            None if the allocation failed.
+
+        :rtype: Optional[MemoryObj]
+        """
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def batched_allocate(
+        self,
+        shape: torch.Size,
+        dtype: torch.dtype,
+        batch_size: int,
+        fmt: MemoryFormat = MemoryFormat.KV_2LTD,
+        eviction: bool = True,
+        busy_loop: bool = True,
+    ) -> Optional[MemoryObj]:
+        """
+        Allocates memory in the backend to hold a tensor of the given shape
+        in a batched manner. The allocated memory objects will have the same
+        shape, dtype, and format.
+
+        :param torch.Size shape: The shape of the tensor to allocate.
+        :param torch.dtype dtype: The dtype of the tensor to allocate.
+        :param int batch_size: The number of memory objects to allocate.
+        :param MemoryFormat fmt: The format of the memory to allocate.
+        :param bool eviction: whether to enable eviction when allocating.
+        :param bool busy_loop: whether to enable a busy loop to wait
+            for in-progress store operations to finish and release the
+            memory space for retrieve.
+
+        :return: A MemoryObj wrapping the allocated memory. Returns
+            None if the allocation failed.
+
+        :rtype: Optional[MemoryObj]
         """
         raise NotImplementedError

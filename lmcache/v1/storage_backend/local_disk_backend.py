@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import TYPE_CHECKING, Callable, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence
 import asyncio
 import itertools
 import os
@@ -22,7 +21,7 @@ from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.lookup_server import LookupServerInterface
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
 from lmcache.v1.storage_backend.abstract_backend import StorageBackendInterface
-from lmcache.v1.storage_backend.evictor import LRUEvictor, PutStatus
+from lmcache.v1.storage_backend.cache_policy import get_cache_policy
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 
 if TYPE_CHECKING:
@@ -33,11 +32,13 @@ logger = init_logger(__name__)
 
 
 class LocalDiskWorker:
-    def __init__(self):
-        self.pq = queue.PriorityQueue()
+    def __init__(self) -> None:
+        self.pq: queue.PriorityQueue[tuple[int, int, str, Callable, dict[str, Any]]] = (
+            queue.PriorityQueue()
+        )
 
         # TODO(Jiayi): remove this hard code.
-        num_workers = 4
+        num_workers = 1
         self.executor = ThreadPoolExecutor(max_workers=num_workers)
 
         self.put_lock = threading.Lock()
@@ -62,8 +63,10 @@ class LocalDiskWorker:
         if task_type == "prefetch":
             priority = 0
             self.insert_prefetch_task(kwargs["key"], None)
-        elif task_type == "put":
+        elif task_type == "delete":
             priority = 1
+        elif task_type == "put":
+            priority = 2
             self.insert_put_task(kwargs["key"])
         else:
             raise ValueError(f"Unknown task type: {task_type}")
@@ -78,6 +81,8 @@ class LocalDiskWorker:
             if task_type == "prefetch":
                 # Remove the prefetch task from the queue
                 self.insert_prefetch_task(kwargs["key"], future)
+
+            self.pq.task_done()
 
     def remove_put_task(self, key: CacheEngineKey):
         with self.put_lock:
@@ -155,7 +160,9 @@ class LocalDiskBackend(StorageBackendInterface):
         lmcache_worker: Optional["LMCacheWorker"] = None,
         lookup_server: Optional[LookupServerInterface] = None,
     ):
-        self.dict: OrderedDict[CacheEngineKey, DiskCacheMetadata] = OrderedDict()
+        self.cache_policy = get_cache_policy(config.cache_policy)
+        self.dict = self.cache_policy.init_mutable_mapping()
+
         self.dst_device = dst_device
 
         self.local_cpu_backend = local_cpu_backend
@@ -169,9 +176,6 @@ class LocalDiskBackend(StorageBackendInterface):
             logger.info(f"Created local disk cache directory: {self.path}")
 
         self.lookup_server = lookup_server
-
-        # Initialize the evictor
-        self.evictor = LRUEvictor(max_cache_size=config.max_local_disk_size)
 
         self.loop = loop
 
@@ -187,6 +191,11 @@ class LocalDiskBackend(StorageBackendInterface):
         logger.info("Using O_DIRECT for disk I/O: %s", self.use_odirect)
 
         self.disk_worker = LocalDiskWorker()
+
+        # TODO(Jiayi): We need a disk space allocator to avoid fragmentation
+        # and hide the following details away from the backend.
+        self.max_cache_size = int(config.max_local_disk_size * 1024**3)
+        self.current_cache_size = 0.0
 
         # to help maintain suffix -> prefix order in the dict
         # assumption: only one request is looked up at a time
@@ -221,7 +230,7 @@ class LocalDiskBackend(StorageBackendInterface):
         # flip the order of the keys in the request
         with self.disk_lock:
             for key in reversed(self.keys_in_request):
-                self.evictor.update_on_hit(key, self.dict)
+                self.cache_policy.update_on_hit(key, self.dict)
             self.keys_in_request = []
 
     def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
@@ -252,17 +261,25 @@ class LocalDiskBackend(StorageBackendInterface):
     def remove(
         self,
         key: CacheEngineKey,
-        free_obj: bool = True,
+        force: bool = True,
     ) -> bool:
-        with self.disk_lock:
-            if not (meta := self.dict.pop(key, None)):
-                return False
+        if force:
+            self.disk_lock.acquire()
+
+        if not (meta := self.dict.pop(key, None)):
+            if force:
+                self.disk_lock.release()
+            return False
 
         path = meta.path
-        size = os.path.getsize(path)
+        size = meta.size
         self.usage -= size
         self.stats_monitor.update_local_storage_usage(self.usage)
-        os.remove(path)
+        self.disk_worker.submit_task("delete", os.remove, path=path)
+
+        if force:
+            self.cache_policy.update_on_force_evict(key)
+            self.disk_lock.release()
 
         # push kv evict msg
         if self.lmcache_worker is not None:
@@ -274,7 +291,7 @@ class LocalDiskBackend(StorageBackendInterface):
 
     def insert_key(self, key: CacheEngineKey, memory_obj: MemoryObj) -> None:
         path = self._key_to_path(key)
-        size = memory_obj.get_size()
+        size = memory_obj.get_physical_size()
         shape = memory_obj.metadata.shape
         dtype = memory_obj.metadata.dtype
         fmt = memory_obj.metadata.fmt
@@ -306,18 +323,29 @@ class LocalDiskBackend(StorageBackendInterface):
             logger.debug(f"Put task for {key} is already in progress.")
             return None
 
-        # Update cache recency
-        evict_keys, put_status = self.evictor.update_on_put(
-            self.dict, memory_obj.get_physical_size()
-        )
-        if put_status == PutStatus.ILLEGAL:
-            return None
-        # evict caches
-        for evict_key in evict_keys:
-            self.remove(evict_key)
-        if self.lookup_server is not None:
-            self.lookup_server.batched_remove(evict_keys)
+        # TODO(Jiayi): Fragmentation is not considered here.
+        required_size = memory_obj.get_physical_size()
+        with self.disk_lock:
+            while self.current_cache_size + required_size > self.max_cache_size:
+                evict_keys = self.cache_policy.get_evict_candidates(
+                    self.dict, num_candidates=1
+                )
+                if not evict_keys:
+                    logger.warning(
+                        "No eviction candidates found.", "Disk space under pressure."
+                    )
+                    return None
 
+                for evict_key in evict_keys:
+                    self.current_cache_size -= self.dict[evict_key].size
+
+                self.batched_remove(evict_keys, force=False)
+
+                if self.lookup_server is not None:
+                    self.lookup_server.batched_remove(evict_keys)
+            self.current_cache_size += required_size
+
+        self.cache_policy.update_on_put(key)
         memory_obj.ref_count_up()
 
         self.disk_worker.submit_task(
@@ -329,7 +357,7 @@ class LocalDiskBackend(StorageBackendInterface):
 
     def batched_submit_put_task(
         self,
-        keys: List[CacheEngineKey],
+        keys: Sequence[CacheEngineKey],
         memory_objs: List[MemoryObj],
         transfer_spec=None,
     ) -> None:
@@ -350,6 +378,9 @@ class LocalDiskBackend(StorageBackendInterface):
         if key not in self.dict:
             self.disk_lock.release()
             return False
+
+        # NOTE(Jiayi): Currently, we consider prefetch as cache hit.
+        self.cache_policy.update_on_hit(key, self.dict)
 
         if self.disk_worker.exists_in_prefetch_tasks(key):
             logger.debug(f"Prefetch task for {key} is already in progress.")
@@ -373,7 +404,7 @@ class LocalDiskBackend(StorageBackendInterface):
         self.dict[key].pin()
 
         # Update cache recency
-        self.evictor.update_on_hit(key, self.dict)
+        self.cache_policy.update_on_hit(key, self.dict)
 
         self.disk_lock.release()
         logger.debug(f"Prefetching {key} from disk.")
@@ -400,6 +431,8 @@ class LocalDiskBackend(StorageBackendInterface):
             self.disk_lock.release()
             return None
 
+        self.cache_policy.update_on_hit(key, self.dict)
+
         self.disk_lock.release()
 
         if memory_obj := self.disk_worker.wait_prefetch_task(key):
@@ -413,16 +446,19 @@ class LocalDiskBackend(StorageBackendInterface):
 
         self.disk_lock.acquire()
         # Update cache recency
-        self.evictor.update_on_hit(key, self.dict)
+        self.cache_policy.update_on_hit(key, self.dict)
 
-        path = self.dict[key].path
-        dtype = self.dict[key].dtype
-        shape = self.dict[key].shape
-        fmt = self.dict[key].fmt
+        disk_meta = self.dict[key]
+        path = disk_meta.path
+        dtype = disk_meta.dtype
+        shape = disk_meta.shape
+        fmt = disk_meta.fmt
         assert dtype is not None
         assert shape is not None
 
-        memory_obj = self.load_bytes_from_disk(path, dtype=dtype, shape=shape, fmt=fmt)
+        memory_obj = self.load_bytes_from_disk(
+            key, path, dtype=dtype, shape=shape, fmt=fmt
+        )
         self.disk_lock.release()
 
         return memory_obj
@@ -452,20 +488,15 @@ class LocalDiskBackend(StorageBackendInterface):
         """
         kv_chunk = memory_obj.tensor
         assert kv_chunk is not None
-        byte_array = memory_obj.byte_array
+        buffer = memory_obj.byte_array
         path = self._key_to_path(key)
 
-        size = len(byte_array)
+        size = len(buffer)
         self.usage += size
         self.stats_monitor.update_local_storage_usage(self.usage)
 
         # FIXME(Jiayi): need to add ref count in disk memory object
-        if size % self.os_disk_bs != 0 or not self.use_odirect:
-            with open(path, "wb") as f:
-                f.write(byte_array)
-        else:
-            fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_DIRECT)
-            os.write(fd, byte_array)
+        self.write_file(buffer, path)
 
         self.insert_key(key, memory_obj)
 
@@ -490,18 +521,7 @@ class LocalDiskBackend(StorageBackendInterface):
         logger.debug("Executing `async_load_bytes` from disk.")
         # FIXME (Jiayi): handle the case where loading fails.
         buffer = memory_obj.byte_array
-        size = len(buffer)
-        if size % self.os_disk_bs != 0 or not self.use_odirect:
-            logger.warning(
-                "Cannot use O_DIRECT for this file, "
-                "size is not aligned to disk block size."
-            )
-            with open(path, "rb") as f:
-                f.readinto(buffer)
-        else:
-            fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
-            fdo = os.fdopen(fd, "rb", buffering=0)
-            fdo.readinto(buffer)
+        self.read_file(key, buffer, path)
 
         self.disk_lock.acquire()
         self.dict[key].unpin()
@@ -518,7 +538,12 @@ class LocalDiskBackend(StorageBackendInterface):
     # TODO(Jiayi): the pinned cpu memory_obj should directly be passed into
     # gpu connector; this gpu buffer could be avoided
     def load_bytes_from_disk(
-        self, path: str, dtype: torch.dtype, shape: torch.Size, fmt: MemoryFormat
+        self,
+        key: CacheEngineKey,
+        path: str,
+        dtype: torch.dtype,
+        shape: torch.Size,
+        fmt: MemoryFormat,
     ) -> Optional[MemoryObj]:
         """
         Load bytearray from disk.
@@ -529,19 +554,53 @@ class LocalDiskBackend(StorageBackendInterface):
         assert memory_obj is not None, "Memory allocation failed during disk load."
 
         buffer = memory_obj.byte_array
+        self.read_file(key, buffer, path)
+        return memory_obj
+
+    def write_file(self, buffer, path):
+        start_time = time.time()
         size = len(buffer)
         if size % self.os_disk_bs != 0 or not self.use_odirect:
+            with open(path, "wb") as f:
+                f.write(buffer)
+        else:
+            fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_DIRECT, 0o644)
+            os.write(fd, buffer)
+            os.close(fd)
+        disk_write_time = time.time() - start_time
+        logger.debug(
+            f"Disk write size: {size} bytes, "
+            f"Bandwidth: {size / disk_write_time / 1e6:.2f} MB/s"
+        )
+
+    def read_file(self, key, buffer, path):
+        start_time = time.time()
+        size = len(buffer)
+        fblock_aligned = size % self.os_disk_bs == 0
+        if not fblock_aligned and self.use_odirect:
             logger.warning(
                 "Cannot use O_DIRECT for this file, "
                 "size is not aligned to disk block size."
             )
-            with open(path, "rb") as f:
-                f.readinto(buffer)
-        else:
-            fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
-            fdo = os.fdopen(fd, "rb", buffering=0)
-            fdo.readinto(buffer)
-        return memory_obj
+
+        try:
+            if not fblock_aligned or not self.use_odirect:
+                with open(path, "rb") as f:
+                    f.readinto(buffer)
+            else:
+                fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+                with os.fdopen(fd, "rb", buffering=0) as fdo:
+                    fdo.readinto(buffer)
+        except FileNotFoundError:
+            if self.dict.get(key, None):
+                self.dict.pop(key)
+            return
+
+        disk_read_time = time.time() - start_time
+        logger.debug(
+            f"Disk read size: {size} bytes, "
+            f"Bandwidth: {size / disk_read_time / 1e6:.2f} MB/s"
+        )
 
     def close(self) -> None:
         if self.lookup_server is not None:

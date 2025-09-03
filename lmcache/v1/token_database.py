@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from typing import Iterable, List, Optional, Tuple, Union
+from typing import Any, Iterable, List, Optional, Tuple, Union
 import abc
 
 # Third Party
@@ -16,14 +16,7 @@ from lmcache.observability import LMCStatsMonitor
 
 logger = init_logger(__name__)
 
-# NOTE: For centralized cache sharing, ensure PYTHONHASHSEED is
-# set consistently across all processes (e.g., export PYTHONHASHSEED=0).
-try:
-    # Third Party
-    from vllm.v1.core.kv_cache_utils import NONE_HASH
-except ImportError:
-    # Fallback to a default value if vllm is not available
-    NONE_HASH = 0
+NONE_HASH: int
 
 
 class TokenDatabase(metaclass=abc.ABCMeta):
@@ -43,6 +36,8 @@ class TokenDatabase(metaclass=abc.ABCMeta):
         config: Optional[LMCacheEngineConfig] = None,
         metadata: Optional[LMCacheEngineMetadata] = None,
     ):
+        global NONE_HASH
+
         vllm_is_available = True
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
         try:
@@ -67,6 +62,17 @@ class TokenDatabase(metaclass=abc.ABCMeta):
             else hash
         )
 
+        # NOTE: For centralized cache sharing, ensure PYTHONHASHSEED is
+        # set consistently across all processes (e.g., export PYTHONHASHSEED=0).
+        try:
+            # Third Party
+            from vllm.v1.core import kv_cache_utils
+
+            kv_cache_utils.init_none_hash(self.hash_func)
+            NONE_HASH = kv_cache_utils.NONE_HASH
+        except (ImportError, AttributeError):
+            NONE_HASH = 0
+
         self.metadata = metadata
 
     @abc.abstractmethod
@@ -77,6 +83,7 @@ class TokenDatabase(metaclass=abc.ABCMeta):
         offsets: Optional[List[int]] = None,
         mask: Optional[torch.Tensor] = None,
         make_key: bool = True,
+        request_configs: Optional[dict] = None,
     ) -> Iterable[Tuple[int, int, Union[CacheEngineKey, int]]]:
         """Process the tokens and return the corresponding cache engine keys.
 
@@ -92,6 +99,11 @@ class TokenDatabase(metaclass=abc.ABCMeta):
             FFFFFTTTTTTT, where True means the tokens needs to be matched,
             and the Falses will ALWAYS be at the PREFIX of the tensor.
 
+        :param bool make_key: Whether to make the cache engine key or not.
+            If False, the hash value will be returned instead.
+
+        :param Optional[dict] request_configs: The configs of the request.
+
         :returns: A iterable of tuples with three elements. The first element
             is the start index of the tokens for the key. The second element
             is the end index of the tokens for the key. The third element is
@@ -100,7 +112,9 @@ class TokenDatabase(metaclass=abc.ABCMeta):
 
         raise NotImplementedError
 
-    def _make_key_by_hash(self, chunk_hash: int):
+    def _make_key_by_hash(
+        self, chunk_hash: int, request_configs: Optional[dict] = None
+    ):
         assert self.metadata is not None
         return CacheEngineKey(
             self.metadata.fmt,
@@ -108,10 +122,14 @@ class TokenDatabase(metaclass=abc.ABCMeta):
             self.metadata.world_size,
             self.metadata.worker_id,
             chunk_hash,
+            request_configs,
         )
 
     def _hash_tokens(
-        self, tokens: Union[torch.Tensor, List[int]], prefix_hash: Optional[int] = None
+        self,
+        tokens: Union[torch.Tensor, List[int]],
+        prefix_hash: Optional[int] = None,
+        extra_keys: Optional[list[Any]] = None,
     ) -> int:
         if isinstance(tokens, torch.Tensor):
             tokens_tuple = tuple(tokens.cpu().tolist())
@@ -120,9 +138,10 @@ class TokenDatabase(metaclass=abc.ABCMeta):
         else:
             raise ValueError(f"Unsupported tokens type: {type(tokens)}")
 
-        if prefix_hash is not None:
-            return self.hash_func((prefix_hash, tokens_tuple))
-        return self.hash_func(tokens_tuple)
+        # Ignore extra keys for now
+        # Extra keys are for multi-modal inputs and
+        # request specific metadata (e.g., LoRA ID).
+        return self.hash_func((prefix_hash, tokens_tuple, extra_keys))
 
 
 class ChunkedTokenDatabase(TokenDatabase):
@@ -202,6 +221,7 @@ class ChunkedTokenDatabase(TokenDatabase):
         offsets: Optional[List[int]] = None,
         mask: Optional[torch.Tensor] = None,
         make_key: bool = True,
+        request_configs: Optional[dict] = None,
     ) -> Iterable[Tuple[int, int, Union[CacheEngineKey, int]]]:
         """Process the tokens/hashes and return the corresponding cache engine keys.
 
@@ -219,6 +239,8 @@ class ChunkedTokenDatabase(TokenDatabase):
 
         :param bool make_key: Whether to make the cache engine key or not.
             If False, the hash value will be returned instead.
+
+        :param Optional[dict] request_configs: The configs of the request.
 
         :returns: A iterable of tuples with three elements. The first element
             is the start index of the tokens for the key. The second element
@@ -250,7 +272,11 @@ class ChunkedTokenDatabase(TokenDatabase):
                 else:
                     self.stats_monitor.add_to_hash_mapping(self._make_key_by_hash(hash_val), token_chunks[chunk_id].tolist())
                     if make_key:
-                        yield start_idx, end_idx, self._make_key_by_hash(hash_val)
+                        yield (
+                            start_idx,
+                            end_idx,
+                            self._make_key_by_hash(hash_val, request_configs),
+                        )
                     else:
                         yield start_idx, end_idx, hash_val
         elif hashes is not None:
@@ -261,7 +287,11 @@ class ChunkedTokenDatabase(TokenDatabase):
             for hash_val, offset in zip(hashes, offsets, strict=False):
                 end_idx = start_idx + offset
                 if make_key:
-                    yield start_idx, end_idx, self._make_key_by_hash(hash_val)
+                    yield (
+                        start_idx,
+                        end_idx,
+                        self._make_key_by_hash(hash_val, request_configs),
+                    )
                 else:
                     yield start_idx, end_idx, hash_val
                 start_idx = end_idx
@@ -322,15 +352,26 @@ class SegmentTokenDatabase(TokenDatabase):
         offsets: Optional[List[int]] = None,
         mask: Optional[torch.Tensor] = None,
         make_key: bool = True,
+        request_configs: Optional[dict] = None,
     ) -> Iterable[Tuple[int, int, Union[CacheEngineKey, int]]]:
         """Process the tokens and return the corresponding cache engine keys.
 
         :param Union[torch.Tensor, List[int]] tokens: The tokens to process.
 
+        :param Optional[List[int]] hashes: The hashes to process. If provided,
+            it will be used instead of tokens to generate cache engine keys.
+
+        :param Optional[List[int]] offsets: The number of tokens in each chunk.
+
         :param Optional[torch.Tensor] mask: The mask for the tokens. Should
             have the same length as tokens. And the mask should ALWAYS be like
             FFFFFTTTTTTT, where True means the tokens needs to be matched,
             and the Falses will ALWAYS be at the PREFIX of the tensor.
+
+        :param bool make_key: Whether to make the cache engine key or not.
+            If False, the hash value will be returned instead.
+
+        :param Optional[dict] request_configs: The configs of the request.
 
         :returns: A iterable of tuples with three elements. The first element
             is the start index of the tokens for the key. The second element
@@ -366,7 +407,9 @@ class SegmentTokenDatabase(TokenDatabase):
                     yield (
                         start_idx,
                         end_idx,
-                        self._make_key_by_hash(self._hash_tokens(token_chunk)),
+                        self._make_key_by_hash(
+                            self._hash_tokens(token_chunk), request_configs
+                        ),
                     )
                 else:
                     yield start_idx, end_idx, self._hash_tokens(token_chunk)

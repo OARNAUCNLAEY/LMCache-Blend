@@ -1,12 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from contextlib import nullcontext
 from copy import deepcopy
-from unittest.mock import patch
 import random
 import shlex
 import subprocess
-import threading
 import time
 
 # Third Party
@@ -21,125 +18,9 @@ import pytest
 import torch
 
 # First Party
+from lmcache.utils import mock_up_broadcast_fn, mock_up_broadcast_object_fn
 from lmcache.v1.cache_engine import LMCacheEngineBuilder
 from lmcache.v1.config import LMCacheEngineConfig
-from lmcache.v1.memory_management import (
-    BufferAllocator,
-    PagedTensorMemoryAllocator,
-    TensorMemoryAllocator,
-)
-
-
-# This is to mock the constructor and destructor of
-# MixedMemoryAllocator and PinMemoryAllocator to
-# use pin_memory=True for their constructors and
-# avoid calling cudaHostRegister and cudaHostUnregister
-# which may throw an error if torch.empty returns a buffer
-# that cannot be registered (which happens quicker on some machines,
-# especially when torch is doing many allocations and frees)
-@pytest.fixture(autouse=True, scope="module")
-def patch_mixed_allocator():
-    def fake_mixed_init(self, size: int, use_paging: bool = False, **kwargs):
-        """
-        :param int size: The size of the pinned memory in bytes.
-        """
-
-        # self.buffer = torch.empty(size, dtype=torch.uint8)
-        # ptr = self.buffer.data_ptr()
-        # err = torch.cuda.cudart().cudaHostRegister(ptr, size, 0)
-        # assert err == 0, (
-        #     f"cudaHostRegister failed: {torch.cuda.cudart().cudaGetErrorString(err)}"
-        # )
-        self._unregistered = False
-        self.buffer = torch.empty(size, dtype=torch.uint8, pin_memory=True)
-
-        if use_paging:
-            assert "shape" in kwargs, (
-                "shape must be specified for paged memory allocator"
-            )
-            assert "dtype" in kwargs, (
-                "dtype must be specified for paged memory allocator"
-            )
-            assert "fmt" in kwargs, "fmt must be specified for paged memory allocator"
-            self.pin_allocator = PagedTensorMemoryAllocator(
-                tensor=self.buffer,
-                shape=kwargs["shape"],
-                dtype=kwargs["dtype"],
-                fmt=kwargs["fmt"],
-            )
-        else:
-            self.pin_allocator = TensorMemoryAllocator(self.buffer)
-
-        self.host_mem_lock = threading.Lock() if not use_paging else nullcontext()
-
-        self.buffer_allocator = BufferAllocator("cpu")
-
-    def fake_mixed_close(self):
-        if not self._unregistered:
-            torch.cuda.synchronize()
-            # torch.cuda.cudart().cudaHostUnregister(self.buffer.data_ptr())
-            self._unregistered = True
-
-    with (
-        patch(
-            "lmcache.v1.memory_management.MixedMemoryAllocator.__init__",
-            fake_mixed_init,
-        ),
-        patch(
-            "lmcache.v1.memory_management.MixedMemoryAllocator.close", fake_mixed_close
-        ),
-    ):
-        yield
-
-
-@pytest.fixture(autouse=True, scope="module")
-def patch_pin_allocator():
-    def fake_pin_init(self, size: int, use_paging: bool = False, **kwargs):
-        """
-        :param int size: The size of the pinned memory in bytes.
-        """
-
-        # self.buffer = torch.empty(size, dtype=torch.uint8)
-        # ptr = self.buffer.data_ptr()
-        # err = torch.cuda.cudart().cudaHostRegister(ptr, size, 0)
-        # assert err == 0, (
-        #     f"cudaHostRegister failed: {torch.cuda.cudart().cudaGetErrorString(err)}"
-        # )
-        self._unregistered = False
-        self.buffer = torch.empty(size, dtype=torch.uint8, pin_memory=True)
-
-        if use_paging:
-            assert "shape" in kwargs, (
-                "shape must be specified for paged memory allocator"
-            )
-            assert "dtype" in kwargs, (
-                "dtype must be specified for paged memory allocator"
-            )
-            assert "fmt" in kwargs, "fmt must be specified for paged memory allocator"
-            self.allocator = PagedTensorMemoryAllocator(
-                tensor=self.buffer,
-                shape=kwargs["shape"],
-                dtype=kwargs["dtype"],
-                fmt=kwargs["fmt"],
-            )
-        else:
-            self.allocator = TensorMemoryAllocator(self.buffer)
-
-        self.host_mem_lock = threading.Lock() if not use_paging else nullcontext()
-
-    def fake_pin_close(self):
-        if not self._unregistered:
-            torch.cuda.synchronize()
-            # torch.cuda.cudart().cudaHostUnregister(self.buffer.data_ptr())
-            self._unregistered = True
-
-    with (
-        patch(
-            "lmcache.v1.memory_management.PinMemoryAllocator.__init__", fake_pin_init
-        ),
-        patch("lmcache.v1.memory_management.PinMemoryAllocator.close", fake_pin_close),
-    ):
-        yield
 
 
 def test_paged_same_retrieve_store(autorelease_v1):
@@ -178,7 +59,12 @@ def test_paged_same_retrieve_store(autorelease_v1):
 
     engine = autorelease_v1(
         LMCacheEngineBuilder.get_or_create(
-            "test", cfg, dumb_metadata(fmt, kv_shape), connector
+            "test",
+            cfg,
+            dumb_metadata(fmt, kv_shape),
+            connector,
+            mock_up_broadcast_fn,
+            mock_up_broadcast_object_fn,
         )
     )
     """ test retrieve empty """
@@ -258,7 +144,12 @@ def test_paged_retrieve_prefix(
 
     engine = autorelease_v1(
         LMCacheEngineBuilder.get_or_create(
-            "test", cfg, dumb_metadata(fmt, kv_shape), connector
+            "test",
+            cfg,
+            dumb_metadata(fmt, kv_shape),
+            connector,
+            mock_up_broadcast_fn,
+            mock_up_broadcast_object_fn,
         )
     )
     """ test store """
@@ -349,7 +240,12 @@ def test_paged_store_offset(
 
     engine = autorelease_v1(
         LMCacheEngineBuilder.get_or_create(
-            "test", cfg, dumb_metadata(fmt, kv_shape), connector
+            "test",
+            cfg,
+            dumb_metadata(fmt, kv_shape),
+            connector,
+            mock_up_broadcast_fn,
+            mock_up_broadcast_object_fn,
         )
     )
     """ test store """
@@ -444,7 +340,12 @@ def test_paged_mixed_retrieve(fmt, chunk_size, backend, autorelease_v1):
 
     engine = autorelease_v1(
         LMCacheEngineBuilder.get_or_create(
-            "test", cfg, dumb_metadata(fmt, kv_shape), connector
+            "test",
+            cfg,
+            dumb_metadata(fmt, kv_shape),
+            connector,
+            mock_up_broadcast_fn,
+            mock_up_broadcast_object_fn,
         )
     )
     """ test store """
@@ -566,7 +467,12 @@ def test_paged_store_kv_tensors_mask(fmt, autorelease_v1):
 
     engine = autorelease_v1(
         LMCacheEngineBuilder.get_or_create(
-            "test", cfg, dumb_metadata(fmt, kv_shape), connector
+            "test",
+            cfg,
+            dumb_metadata(fmt, kv_shape),
+            connector,
+            mock_up_broadcast_fn,
+            mock_up_broadcast_object_fn,
         )
     )
     """ Store some tokens with mask """
@@ -721,7 +627,12 @@ def test_paged_hierarchy_retrieve(
 
     engine = autorelease_v1(
         LMCacheEngineBuilder.get_or_create(
-            "test", cfg, dumb_metadata(fmt, kv_shape), connector
+            "test",
+            cfg,
+            dumb_metadata(fmt, kv_shape),
+            connector,
+            mock_up_broadcast_fn,
+            mock_up_broadcast_object_fn,
         )
     )
     """ test store """
@@ -838,7 +749,12 @@ def test_paged_prefetch_retrieve(backend, prefetch_from, autorelease_v1):
 
     engine = autorelease_v1(
         LMCacheEngineBuilder.get_or_create(
-            "test", cfg, dumb_metadata(fmt, kv_shape), connector
+            "test",
+            cfg,
+            dumb_metadata(fmt, kv_shape),
+            connector,
+            mock_up_broadcast_fn,
+            mock_up_broadcast_object_fn,
         )
     )
     """ test store """
@@ -914,6 +830,7 @@ def test_paged_prefetch_retrieve(backend, prefetch_from, autorelease_v1):
         "local_cpu_disk_remote",
     ],
 )
+@pytest.mark.no_shared_allocator
 @pytest.mark.parametrize("lmserver_v1_process", ["cpu"], indirect=True)
 def test_paged_mem_leak(fmt, chunk_size, backend, lmserver_v1_process, autorelease_v1):
     url = None
@@ -941,7 +858,12 @@ def test_paged_mem_leak(fmt, chunk_size, backend, lmserver_v1_process, autorelea
 
     engine = autorelease_v1(
         LMCacheEngineBuilder.get_or_create(
-            "test", cfg, dumb_metadata(fmt, kv_shape), connector
+            "test",
+            cfg,
+            dumb_metadata(fmt, kv_shape),
+            connector,
+            mock_up_broadcast_fn,
+            mock_up_broadcast_object_fn,
         )
     )
 
@@ -991,11 +913,23 @@ def test_builder(autorelease_v1):
     assert should_be_none is None
 
     _engine = autorelease_v1(
-        LMCacheEngineBuilder.get_or_create(instance_id, cfg, dumb_metadata(), connector)
+        LMCacheEngineBuilder.get_or_create(
+            instance_id,
+            cfg,
+            dumb_metadata(),
+            connector,
+            mock_up_broadcast_fn,
+            mock_up_broadcast_object_fn,
+        )
     )
     _engine2 = autorelease_v1(LMCacheEngineBuilder.get(instance_id))  # noqa
 
     with pytest.raises(ValueError):
         LMCacheEngineBuilder.get_or_create(
-            instance_id, cfg2, dumb_metadata(), connector
+            instance_id,
+            cfg2,
+            dumb_metadata(),
+            connector,
+            mock_up_broadcast_fn,
+            mock_up_broadcast_object_fn,
         )

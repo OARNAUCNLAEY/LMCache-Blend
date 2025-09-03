@@ -1,4 +1,4 @@
-# The LMcache Dockerfile is used to build a LMCache image that is integrated
+# The LMCache Dockerfile is used to build a LMCache image that is integrated
 # to run with vLLM OpenAI server.
 
 # Please update any changes made here to
@@ -76,19 +76,16 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     . /opt/venv/bin/activate && \
     uv pip install -r cuda.txt
 
-# cuda arch list used by torch
-# can be useful for both `dev` and `test`
-# explicitly set the list to avoid issues with torch 2.2
-# see https://github.com/pytorch/pytorch/pull/123243
-ARG torch_cuda_arch_list='7.0 7.5 8.0 8.6 8.9 9.0+PTX'
+# CUDA arch list used by torch
+ARG torch_cuda_arch_list='7.0 7.5 8.0 8.6 8.9 9.0 10.0+PTX'
 ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
+
 # Override the arch list for flash-attn to reduce the binary size
-ARG vllm_fa_cmake_gpu_arches='80-real;90-real'
+ARG vllm_fa_cmake_gpu_arches='80-real;90-real;100-real'
 ENV VLLM_FA_CMAKE_GPU_ARCHES=${vllm_fa_cmake_gpu_arches}
 
-#################### vLLM IMAGE & LMCache (Build) #######################
-# Integrate vLLM nightly build and LMCache build and
-# expose vLLM OpenAI API
+#################### vLLM IMAGE & LMCache (Build) ##########################
+# Integrate vLLM nightly build and LMCache build, and expose vLLM OpenAI API
 
 FROM base AS image-build
 
@@ -112,27 +109,32 @@ ARG LMCACHE_COMMIT_ID=1
 COPY . /workspace/LMCache
 WORKDIR /workspace/LMCache
 
-# Build LMCache
-RUN --mount=type=cache,target=/root/.cache/ccache \
-    --mount=type=cache,target=/root/.cache/pip \
+# Build LMCache.
+# As we are installing vLLM before LMCache, we will implicitly use
+# the same torch version as the vLLM nightly build when running the LMCache build.
+# This means that LMCache is in sync with the vLLM torch version.
+# Stable vLLM release will be used if nightly build is not available.
+RUN --mount=type=cache,target=/root/.cache/ccache,id=ccache \
+    --mount=type=cache,target=/root/.cache/uv,id=uv-cache,sharing=locked \
     . /opt/venv/bin/activate && \
-    python3 setup.py bdist_wheel --dist-dir=dist_lmcache
-
-# Install LMCache latest build and vLLM nightly build
-RUN . /opt/venv/bin/activate && \
-    uv pip install --prerelease=allow vllm[runai,tensorizer] --extra-index-url https://wheels.vllm.ai/nightly && \
-    uv pip install /workspace/LMCache/dist_lmcache/*.whl --verbose
+    uv pip install --prerelease=allow 'vllm[runai,tensorizer]' \
+        --extra-index-url https://wheels.vllm.ai/nightly \
+        --index-strategy unsafe-best-match && \
+    python3 -c 'import torch; print("TORCH=", torch.__version__)' && \
+    python3 setup.py bdist_wheel --dist-dir=dist_lmcache && \
+    uv pip install ./dist_lmcache/*.whl --verbose
 
 WORKDIR /workspace
 ENTRYPOINT ["/opt/venv/bin/vllm", "serve"]
 
 #################### vLLM IMAGE & LMCache (Release) #######################
-# Integrate vLLM and LMCache stable releases and expose vLLM
-# OpenAI API
+# Integrate vLLM and LMCache stable releases, and expose vLLM OpenAI API
 
 FROM base AS image-release
 
-# Install LMCache and vLLM stable releases
+# Install LMCache and vLLM stable releases.
+# It is imperative that LMCache uses the same torch version as the 
+# vLLM stable release.
 RUN . /opt/venv/bin/activate && \
     uv pip install --prerelease=allow vllm[runai,tensorizer] && \
     uv pip install lmcache --verbose

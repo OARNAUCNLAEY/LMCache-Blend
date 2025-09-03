@@ -2,13 +2,7 @@
 # Standard
 from collections import OrderedDict
 from concurrent.futures import Future
-from typing import (
-    TYPE_CHECKING,
-    Generator,
-    List,
-    Optional,
-    Sequence,
-)
+from typing import TYPE_CHECKING, Generator, List, Optional, Sequence
 import asyncio
 import threading
 
@@ -18,7 +12,11 @@ import torch
 # First Party
 from lmcache.config import LMCacheEngineMetadata
 from lmcache.logging import init_logger
-from lmcache.utils import CacheEngineKey, _lmcache_nvtx_annotate
+from lmcache.utils import (
+    CacheEngineKey,
+    _lmcache_nvtx_annotate,
+    start_loop_in_thread_with_exceptions,
+)
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.lookup_server import LookupServerInterface
 from lmcache.v1.memory_management import (
@@ -27,7 +25,10 @@ from lmcache.v1.memory_management import (
     MemoryObj,
 )
 from lmcache.v1.storage_backend import CreateStorageBackends
-from lmcache.v1.storage_backend.abstract_backend import StorageBackendInterface
+from lmcache.v1.storage_backend.abstract_backend import (
+    AllocatorBackendInterface,
+    StorageBackendInterface,
+)
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 
 if TYPE_CHECKING:
@@ -52,7 +53,12 @@ class StorageManager:
         lookup_server: Optional[LookupServerInterface] = None,
     ):
         self.loop = asyncio.new_event_loop()
-        self.thread = threading.Thread(target=self.loop.run_forever)
+
+        self.thread = threading.Thread(
+            target=start_loop_in_thread_with_exceptions,
+            args=(self.loop,),
+            name="storage-manger-event-loop",
+        )
         self.thread.start()
 
         dst_device = "cuda"
@@ -70,12 +76,9 @@ class StorageManager:
 
         self.enable_nixl = config.enable_nixl
 
-        if self.enable_nixl:
-            self.allocator_backend = self.storage_backends["NixlBackend"]
-            if config.local_cpu:
-                self.local_cpu_backend = self.storage_backends["LocalCPUBackend"]
-        else:
-            self.allocator_backend = self.storage_backends["LocalCPUBackend"]
+        self.allocator_backend = self._get_allocator_backend(config)
+        if config.local_cpu:
+            self.local_cpu_backend = self.storage_backends["LocalCPUBackend"]
 
         self.manager_lock = threading.Lock()
 
@@ -87,6 +90,16 @@ class StorageManager:
 
         self.nixl_offload_stream = torch.cuda.Stream()
 
+    def _get_allocator_backend(
+        self, config: LMCacheEngineConfig
+    ) -> AllocatorBackendInterface:
+        if self.enable_nixl:
+            allocator_backend = self.storage_backends["NixlBackend"]
+        else:
+            allocator_backend = self.storage_backends["LocalCPUBackend"]
+        assert isinstance(allocator_backend, AllocatorBackendInterface)
+        return allocator_backend
+
     @_lmcache_nvtx_annotate
     def allocate(
         self,
@@ -94,6 +107,7 @@ class StorageManager:
         dtype: torch.dtype,
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         eviction=True,
+        busy_loop=True,
     ) -> Optional[MemoryObj]:
         """
         Allocate memory object with memory allocator.
@@ -101,7 +115,9 @@ class StorageManager:
         """
         # TODO (Jiayi): We might need to pre-allocate and management
         # disk in a similar way as CPU.
-        return self.allocator_backend.allocate(shape, dtype, fmt, eviction=eviction)
+        return self.allocator_backend.allocate(
+            shape, dtype, fmt, eviction=eviction, busy_loop=busy_loop
+        )
 
     @_lmcache_nvtx_annotate
     def batched_allocate(
@@ -111,6 +127,7 @@ class StorageManager:
         batch_size: int,
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         eviction=True,
+        busy_loop=True,
     ) -> Optional[MemoryObj]:
         """
         Batched allocate memory object with memory allocator.
@@ -119,7 +136,7 @@ class StorageManager:
         # TODO (Jiayi): We might need to pre-allocate and management
         # disk in a similar way as CPU.
         return self.allocator_backend.batched_allocate(
-            shape, dtype, batch_size, fmt, eviction=eviction
+            shape, dtype, batch_size, fmt, eviction=eviction, busy_loop=busy_loop
         )
 
     def put(
@@ -133,7 +150,9 @@ class StorageManager:
         Do not store if the same object is being stored (handled here by
         storage manager) or has been stored (handled by storage backend).
         """
-
+        raise RuntimeError(
+            "StorageManager.put is deprecated and should not be called anymore"
+        )
         for backend_name, backend in self.storage_backends.items():
             if location and backend_name != location:
                 continue
@@ -169,11 +188,13 @@ class StorageManager:
                 for key, memory_obj in zip(keys, memory_objs, strict=False):
                     if self.local_cpu_backend.contains(key):
                         continue
+                    assert isinstance(self.local_cpu_backend, LocalCPUBackend)
                     cpu_memory_obj = self.local_cpu_backend.allocate(
-                        shape=memory_obj.tensor.shape,
-                        dtype=memory_obj.tensor.dtype,
+                        shape=memory_obj.get_shape(),
+                        dtype=memory_obj.get_dtype(),
                         fmt=memory_obj.meta.fmt,
                         eviction=True,
+                        busy_loop=False,
                     )
                     if cpu_memory_obj is None:
                         break
@@ -235,6 +256,7 @@ class StorageManager:
         """
         Non-blocking function to get the memory object from the storages.
         """
+        logger.warning("Calling an unstable interface: get_non_blocking")
         # TODO (Jiayi): incorporate prefetching here
 
         # Search all backends for non-blocking get
@@ -252,10 +274,11 @@ class StorageManager:
         self,
         keys: List[CacheEngineKey],
         location: Optional[str] = None,
-    ) -> Optional[List[MemoryObj]]:
+    ) -> Optional[List[Optional[MemoryObj]]]:
         """
         Blocking function to get the memory objects from the storages.
         """
+        # TODO (ApostaC): remove the nested optional here
         for backend_name, storage_backend in self.storage_backends.items():
             if location and backend_name != location:
                 continue
