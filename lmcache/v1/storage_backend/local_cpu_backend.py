@@ -10,7 +10,7 @@ import torch
 
 # First Party
 from lmcache.logging import init_logger
-from lmcache.observability import LMCStatsMonitor, PrometheusLogger, CacheEvent
+from lmcache.observability import LMCStatsMonitor, JsonLogger, CacheEvent
 from lmcache.utils import CacheEngineKey, _lmcache_nvtx_annotate
 from lmcache.v1.cache_controller.message import KVAdmitMsg, KVEvictMsg
 from lmcache.v1.config import LMCacheEngineConfig
@@ -70,7 +70,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         self._setup_metrics()
 
     def _setup_metrics(self):
-        prometheus_logger = PrometheusLogger.GetInstanceOrNone()
+        prometheus_logger = JsonLogger.GetInstanceOrNone()
         if prometheus_logger is not None:
             prometheus_logger.local_cpu_hot_cache_count.set_function(
                 lambda: len(self.hot_cache)

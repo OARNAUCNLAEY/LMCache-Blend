@@ -270,7 +270,7 @@ class ChunkedTokenDatabase(TokenDatabase):
                 if start_idx < num_falses:
                     continue
                 else:
-                    self.stats_monitor.add_to_hash_mapping(self._make_key_by_hash(hash_val), token_chunks[chunk_id].tolist())
+                    # self.stats_monitor.add_to_hash_mapping(self._make_key_by_hash(hash_val), token_chunks[chunk_id].tolist())
                     if make_key:
                         yield (
                             start_idx,
