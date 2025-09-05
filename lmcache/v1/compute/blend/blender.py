@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from typing import Optional
-
+import time
+    
 # Third Party
 import torch
 
@@ -11,6 +12,7 @@ from lmcache.v1.compute.attention.metadata import LMCAttnMetadata
 from lmcache.v1.compute.blend.metadata import LMCBlendCommonMetadata, LMCBlendMetadata
 from lmcache.v1.compute.models.utils import infer_model_from_vllm
 from lmcache.v1.config import LMCacheEngineConfig
+from lmcache.observability import LMCStatsMonitor
 
 logger = init_logger(__name__)
 
@@ -67,6 +69,8 @@ class LMCBlender:
         logger.debug(f"Blender is processing KV for layer {layer_id}")
         old_k, old_v = self.gpu_connector.get_kv(layer_id)
 
+        start_time = time.time()
+
         if attn_output is None:
             attn_output = torch.empty(
                 q.shape,
@@ -108,6 +112,8 @@ class LMCBlender:
             attn_output = attn_output[:topk_num]
 
             attn_metadata.update_from_top_indices(top_indices)
+            
+            LMCStatsMonitor.GetOrCreate().on_blend_complete(start_time, topk_num)
 
         if self.metadata.imp_indices is not None:
             old_k[self.metadata.imp_indices] = k

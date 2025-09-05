@@ -58,6 +58,11 @@ class LMCacheStats:
     # Real time value measurements (will be reset after each log)
     retrieve_hit_rate: float
     lookup_hit_rate: float
+    
+    time_spent_blending: float
+    time_spent_storing: float
+    time_spent_retrieving: float
+    blend_tokens: int
 
     local_cache_usage_bytes: int  # Size of the used local cache in bytes
     remote_cache_usage_bytes: int  # Size of the used remote cache in bytes
@@ -137,6 +142,11 @@ class LMCStatsMonitor:
         self.interval_remote_read_bytes = 0
         self.interval_remote_write_requests = 0
         self.interval_remote_write_bytes = 0
+        
+        self.time_spent_blending = 0
+        self.time_spent_retrieving = 0
+        self.time_spent_storing = 0
+        self.blend_tokens = 0
 
         # remote backends get/put cost time metrics
         self.interval_remote_time_to_get: List[float] = []
@@ -195,6 +205,12 @@ class LMCStatsMonitor:
         self.interval_lookup_hits += num_hit_tokens
 
     @thread_safe
+    def on_blend_complete(self, blend_time: float, tokens: int):
+        curr_time = time.time()
+        self.time_spent_blending += curr_time - blend_time
+        self.blend_tokens += tokens
+    
+    @thread_safe
     def on_retrieve_request(self, num_tokens: int) -> int:
         """
         Returns the internal "request id" that will be used in
@@ -221,6 +237,7 @@ class LMCStatsMonitor:
         retrieve_stats = self.retrieve_requests[request_id]
         retrieve_stats.local_hit_tokens = retrieved_tokens
         retrieve_stats.end_time = curr_time
+        self.time_spent_retrieving += retrieve_stats.end_time - retrieve_stats.start_time
         self.interval_hit_tokens += retrieved_tokens
 
     @thread_safe
@@ -243,6 +260,7 @@ class LMCStatsMonitor:
         assert request_id in self.store_requests
         store_stats = self.store_requests[request_id]
         store_stats.end_time = curr_time
+        self.time_spent_storing += store_stats.end_time - store_stats.start_time
         if num_tokens >= 0:
             store_stats.num_tokens = num_tokens
 
@@ -443,6 +461,10 @@ class LMCStatsMonitor:
             store_speed=store_speed,
             cache_events = self.cache_events,
             hash_chunk_mapping = self.hash_chunk_mapping,
+            time_spent_blending=self.time_spent_blending,
+            time_spent_retrieving=self.time_spent_retrieving,
+            time_spent_storing=self.time_spent_storing,
+            blend_tokens=self.blend_tokens,
         )
         self._clear()
         return ret
@@ -1063,12 +1085,14 @@ class JsonLogger:
         for event in CacheEvent._member_names_:
             sorted_events[event] = []
             for hash_key in self._cache_event_counter_by_hash:
-                if event not in self._cache_event_counter_by_hash[hash_key]:
+                if event not in self._cache_event_counter_by_hash[hash_key] or hash_key not in self._hash_token_mapping:
                     break
                 sorted_events[event].append((self._hash_token_mapping[hash_key], self._cache_event_counter_by_hash[hash_key][event]))
             sorted_events[event] = sorted(sorted_events[event], key=lambda x: -1*x[1])
         custom_cache_event_counter = {}
         for key in self._cache_event_counter_by_hash:
+            if key not in self._hash_token_mapping or key not in self._cache_event_counter_by_hash:
+                break
             custom_cache_event_counter[self._hash_token_mapping[key]] = self._cache_event_counter_by_hash[key]
         final_dict = {
             "labels": self.labels,
@@ -1080,7 +1104,6 @@ class JsonLogger:
             self.counter_num_remote_read_bytes.name : self.counter_num_remote_read_bytes.get_dict(),
             self.counter_num_remote_write_requests.name : self.counter_num_remote_write_requests.get_dict(),
             self.counter_num_remote_write_bytes.name :  self.counter_num_remote_write_bytes.get_dict(),
-            self.gauge_cache_hit_rate.name : self.gauge_cache_hit_rate.get_dict(),
             self.gauge_local_cache_usage.name : self.gauge_local_cache_usage.get_dict(),
             self.gauge_remote_cache_usage.name : self.gauge_remote_cache_usage.get_dict(),
             self.gauge_local_storage_usage.name : self.gauge_local_storage_usage.get_dict(),
@@ -1095,6 +1118,10 @@ class JsonLogger:
             self.counter_remote_ping_errors.name : self.counter_remote_ping_errors.get_dict(),
             self.counter_remote_ping_successes.name : self.counter_remote_ping_successes.get_dict(),
             self.gauge_remote_ping_error_code.name : self.gauge_remote_ping_error_code.get_dict(),
+            self.blend_tokens.name: self.blend_tokens.get_dict(),
+            self.total_blend_time_spent.name: self.total_blend_time_spent.get_dict(),
+            self.total_retrive_time_spent.name: self.total_retrive_time_spent.get_dict(),
+            self.total_store_time_spent.name: self.total_store_time_spent.get_dict(),
             "Top chunks by event": sorted_events,
             "Cache Events by strings": custom_cache_event_counter,
             "Hash <-> token" : self._hash_token_mapping,
@@ -1131,6 +1158,27 @@ class JsonLogger:
             labelnames=labelnames,
         )
 
+        self.total_blend_time_spent = self._counter_cls(
+            name="lmcache:total_blend_time_spent",
+            documentation="Time spent in blending",
+            labelnames=labelnames,
+        )
+        self.total_retrive_time_spent = self._counter_cls(
+            name="lmcache:total_retrieve_time_spent",
+            documentation="Time spent in retrieving",
+            labelnames=labelnames,
+        )
+        self.total_store_time_spent = self._counter_cls(
+            name="lmcache:total_storing_time_spent",
+            documentation="Time spent in storing",
+            labelnames=labelnames,
+        )
+        self.blend_tokens = self._counter_cls(
+            name="lmcache:blend_tokens",
+            documentation="Total tokens blended",
+            labelnames=labelnames,
+        )
+        
         self.counter_num_hit_tokens = self._counter_cls(
             name="lmcache:num_hit_tokens",
             documentation="Total number of tokens hit in lmcache",
@@ -1448,8 +1496,27 @@ class JsonLogger:
             self.counter_num_remote_write_bytes,
             stats.interval_remote_write_bytes,
         )
+        
+        self._log_counter(
+            self.total_blend_time_spent,
+            stats.time_spent_blending
+        )
 
-        self._log_gauge(self.gauge_cache_hit_rate, stats.cache_hit_rate)
+        self._log_counter(
+            self.total_retrive_time_spent,
+            stats.time_spent_retrieving
+        )
+
+        self._log_counter(
+            self.total_store_time_spent,
+            stats.time_spent_storing
+        )
+
+        self._log_counter(
+            self.blend_tokens,
+            stats.blend_tokens
+        )
+
 
         self._log_gauge(self.gauge_local_cache_usage, stats.local_cache_usage_bytes)
 
