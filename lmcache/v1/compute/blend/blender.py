@@ -87,18 +87,24 @@ class LMCBlender:
         attn_layer = layer.self_attn
         q, k = attn_layer.rotary_emb(self.metadata.positions, q, k)
 
+        if self.metadata.offset is None:
+            self.metadata.offset = k.shape[0] - old_k.shape[0] # finding vllm cached length
+        offset = self.metadata.offset
+        
         if layer_id in self.common_metadata.check_layers:
             diff_k = torch.sum(
-                (k.to(torch.float32) - old_k.to(torch.float32)) ** 2, dim=[1]
-            )
+                (k[offset:].to(torch.float32) - old_k.to(torch.float32)) ** 2, dim=[1]
+            ) #computing diff only for blendable tokens not for vllm cached ones
             total_len = diff_k.shape[0]
 
             assert self.common_metadata.recomp_ratios is not None
 
             # TODO(Jiayi): remove `[0]` hardcode
-            topk_num = int(total_len * self.common_metadata.recomp_ratios[0])
+            assert total_len != 0
+            topk_num = max(1, int(total_len * self.common_metadata.recomp_ratios[0])) #forcing the case where atleast one token is blended.
 
-            top_indices = torch.topk(diff_k, k=topk_num).indices
+            raw_top_indices = torch.topk(diff_k, k=topk_num).indices
+            top_indices = torch.cat((raw_top_indices + offset, torch.arange(0, offset).to(q.device)), dim = 0) # added vllmcached tokens here
             top_indices, _ = torch.sort(top_indices)
 
             k, v = k[top_indices], v[top_indices]
@@ -107,18 +113,18 @@ class LMCBlender:
 
             logger.debug(f"Number of indices picked: {len(top_indices)}")
 
-            self.metadata.imp_indices = top_indices
+            self.metadata.imp_indices = raw_top_indices #raw indices updated to update the lmcache k, v
             self.metadata.positions = self.metadata.positions[top_indices]
-            attn_output = attn_output[:topk_num]
+            attn_output = attn_output[top_indices]
 
             attn_metadata.update_from_top_indices(top_indices)
             
             LMCStatsMonitor.GetOrCreate().on_blend_complete(start_time, topk_num)
 
         if self.metadata.imp_indices is not None:
-            old_k[self.metadata.imp_indices] = k
-            old_v[self.metadata.imp_indices] = v
-            return q, old_k, old_v, residual, attn_output, attn_metadata
+            old_k[self.metadata.imp_indices] = k[offset:]
+            old_v[self.metadata.imp_indices] = v[offset:]
+            return q, torch.cat((k[:offset], old_k), dim = 0), torch.cat((v[:offset], old_v), dim = 0), residual, attn_output, attn_metadata
         else:
             return q, k, v, residual, attn_output, attn_metadata
 
