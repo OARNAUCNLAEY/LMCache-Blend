@@ -401,7 +401,7 @@ class SegmentTokenDatabase(TokenDatabase):
                 start_idx += self.sep_len
                 end_idx += self.sep_len
                 # end_idx = min(end_idx, len(tokens))
-            if start_idx >= num_falses:
+            if end_idx > num_falses:
                 self.stats_monitor.add_to_hash_mapping(self._make_key_by_hash(self._hash_tokens(token_chunk)), token_chunk.tolist())
                 if make_key:
                     yield (
