@@ -8,6 +8,7 @@ from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey
 from lmcache.v1.storage_backend.cache_policy.base_policy import BaseCachePolicy
 
+from lmcache.observability import LMCStatsMonitor, JsonLogger, CacheEvent
 logger = init_logger(__name__)
 
 
@@ -27,6 +28,7 @@ class LRUCachePolicy(BaseCachePolicy[OrderedDict[CacheEngineKey, Any]]):
         key: CacheEngineKey,
         cache_dict: OrderedDict[CacheEngineKey, Any],
     ) -> None:
+        self.stats_monitor.add_cache_event(CacheEvent.HIT, key)
         cache_dict.move_to_end(key)
 
     def update_on_put(
@@ -34,13 +36,16 @@ class LRUCachePolicy(BaseCachePolicy[OrderedDict[CacheEngineKey, Any]]):
         key: CacheEngineKey,
     ) -> None:
         # No action needed for LRU on put, as the key is already at the end.
-        pass
+        self.stats_monitor.add_cache_event(CacheEvent.STORE, key)
+        return
 
     def update_on_force_evict(
         self,
         key: CacheEngineKey,
     ) -> None:
-        pass
+        
+        self.stats_monitor.add_cache_event(CacheEvent.EVICT, key)
+        return 
 
     # NOTE(Jiayi): We do best effort to get eviction candidates so the number
     # of returned keys mignt be smaller than num_candidates.

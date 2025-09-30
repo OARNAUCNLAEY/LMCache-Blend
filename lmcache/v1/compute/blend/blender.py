@@ -113,13 +113,14 @@ class LMCBlender:
 
             attn_metadata.update_from_top_indices(top_indices)
             
-            LMCStatsMonitor.GetOrCreate().on_blend_complete(start_time, topk_num)
 
         if self.metadata.imp_indices is not None:
             old_k[self.metadata.imp_indices] = k
             old_v[self.metadata.imp_indices] = v
+            LMCStatsMonitor.GetOrCreate().on_blend_complete(start_time, topk_num)
             return q, old_k, old_v, residual, attn_output, attn_metadata
         else:
+            LMCStatsMonitor.GetOrCreate().on_blend_complete(start_time, topk_num)
             return q, k, v, residual, attn_output, attn_metadata
 
     # NOTE(Jiayi): Exposing this `blend_layer` interface as we might

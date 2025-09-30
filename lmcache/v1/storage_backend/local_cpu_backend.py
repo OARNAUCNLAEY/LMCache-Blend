@@ -121,7 +121,6 @@ class LocalCPUBackend(AllocatorBackendInterface):
             self.hot_cache[key] = memory_obj
 
             self.cache_policy.update_on_put(key)
-            self.stats_monitor.add_cache_event(CacheEvent.STORE, key)
 
             # TODO(Jiayi): optimize this with batching?
             # push kv admit msg
@@ -220,7 +219,6 @@ class LocalCPUBackend(AllocatorBackendInterface):
 
         if force:
             self.cache_policy.update_on_force_evict(key)
-            self.stats_monitor.add_cache_event(CacheEvent.EVICT, key)
             self.cpu_lock.release()
 
         if self.lmcache_worker is not None:
