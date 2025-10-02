@@ -86,7 +86,7 @@ class LMCBlender:
         layer = self.layerwise_model.vllm_model.model.layers[layer_id]
         attn_layer = layer.self_attn
         q, k = attn_layer.rotary_emb(self.metadata.positions, q, k)
-
+        topk_num = 0
         if layer_id in self.common_metadata.check_layers:
             diff_k = torch.sum(
                 (k.to(torch.float32) - old_k.to(torch.float32)) ** 2, dim=[1]
@@ -120,6 +120,7 @@ class LMCBlender:
             LMCStatsMonitor.GetOrCreate().on_blend_complete(start_time, topk_num)
             return q, old_k, old_v, residual, attn_output, attn_metadata
         else:
+
             LMCStatsMonitor.GetOrCreate().on_blend_complete(start_time, topk_num)
             return q, k, v, residual, attn_output, attn_metadata
 

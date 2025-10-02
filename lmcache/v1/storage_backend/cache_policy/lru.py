@@ -19,6 +19,7 @@ class LRUCachePolicy(BaseCachePolicy[OrderedDict[CacheEngineKey, Any]]):
 
     def __init__(self):
         logger.info("Initializing LRUCachePolicy")
+        self.stats_monitor = LMCStatsMonitor.GetOrCreate()
 
     def init_mutable_mapping(self) -> OrderedDict[CacheEngineKey, Any]:
         return OrderedDict()
