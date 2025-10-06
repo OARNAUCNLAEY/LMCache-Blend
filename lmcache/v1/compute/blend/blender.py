@@ -138,7 +138,7 @@ class LMCBlender:
 
         # TODO(Jiayi): store is currently not included in this function
 
-        layerwise_model_executor = self.layerwise_model.compute_layer(tokens)
+        # layerwise_model_executor = self.layerwise_model.compute_layer(tokens)
         layerwise_retriever = self.cache_engine.retrieve_layer(tokens, mask, **kwargs)
 
         next(layerwise_retriever)
@@ -146,7 +146,7 @@ class LMCBlender:
 
         for i in range(self.num_layers):
             next(layerwise_retriever)
-            next(layerwise_model_executor)
+            # next(layerwise_model_executor)
             yield
 
         next(layerwise_retriever)
