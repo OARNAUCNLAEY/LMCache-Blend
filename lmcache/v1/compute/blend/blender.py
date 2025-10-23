@@ -15,7 +15,7 @@ from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.observability import LMCStatsMonitor
 
 logger = init_logger(__name__)
-
+import os
 
 class LMCBlender:
     """
@@ -43,9 +43,14 @@ class LMCBlender:
         self.num_layers = len(vllm_model.model.layers)
 
         # TODO (Jiayi): make this less hard-coded
+        recomp_ratios = [0.15]
+        if "LMCACHE_RECOMP_RATIO" in os.environ:
+            recomp_ratios = [float(os.environ["LMCACHE_RECOMP_RATIO"])]
+        
+        print(f"RECOMP RATIO SELECTED: {recomp_ratios}")
         self.common_metadata = LMCBlendCommonMetadata(
             check_layers=[1],
-            recomp_ratios=[0.15],
+            recomp_ratios=recomp_ratios,
             thresholds=None,
         )
 
