@@ -59,7 +59,7 @@ class FusedRope:
         self.rope = rope
         self.is_neox_style = is_neox_style
         self.head_size = rope.head_size
-        self.cos_sin_cache = rope.cos_sin_cache
+        self.cos_sin_cache = rope.cos_sin_cache.cuda()
 
     def fused_encode(self, old_positions, new_positions, k):
         num_tokens = k.shape[0]
